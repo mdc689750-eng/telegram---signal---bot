@@ -1,174 +1,258 @@
-import os, time, requests, pandas as pd
+import os
+import json
+import time
+import uuid
+import threading
+import requests
+import websocket
+import pandas as pd
+
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-# REAL M1 FX DATA -> ANALYSIS -> TELEGRAM
-# Data source: OANDA v20 API
-# Telegram: Bot API
 
-TOKEN = os.getenv("OANDA_TOKEN", "").strip()
-ACCOUNT = os.getenv("OANDA_ACCOUNT_ID", "").strip()
-ENV = os.getenv("OANDA_ENV", "practice").strip().lower()
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# ============================================================
+# ALLTICK REAL-TIME FOREX -> M1 SIGNAL -> TELEGRAM
+# ============================================================
 
-PAIRS = [x.strip() for x in os.getenv(
-    "PAIRS",
-    "EUR_USD,GBP_USD,USD_JPY,USD_CHF,AUD_USD,EUR_JPY,GBP_JPY,EUR_GBP"
-).split(",") if x.strip()]
+ALLTICK_TOKEN = os.getenv("ALLTICK_API_TOKEN", "").strip()
 
-BASE = "https://api-fxtrade.oanda.com" if ENV == "live" else "https://api-fxpractice.oanda.com"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Free AllTick plan: maximum 5 tick products per WebSocket
+DEFAULT_PAIRS = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD"
+
+PAIRS = [
+    x.strip().upper()
+    for x in os.getenv("PAIRS", DEFAULT_PAIRS).split(",")
+    if x.strip()
+][:5]
+
+WS_URL = "wss://quote.alltick.co/quote-b-ws-api"
+
+KLINE_URL = "https://quote.alltick.co/quote-b-api/kline"
+
 IST = ZoneInfo("Asia/Kolkata")
-POLL_SECONDS = 5
-COUNT = 150
 
-def headers():
-    return {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+HISTORY_CANDLES = 100
 
-def candles(pair):
-    url = f"{BASE}/v3/accounts/{ACCOUNT}/instruments/{pair}/candles"
-    r = requests.get(url, headers=headers(),
-                     params={"granularity":"M1","count":COUNT,"price":"M"},
-                     timeout=15)
-    r.raise_for_status()
-    rows = []
-    for c in r.json().get("candles", []):
-        if not c.get("complete"): continue
-        m = c["mid"]
-        rows.append({
-            "time":c["time"], "open":float(m["o"]), "high":float(m["h"]),
-            "low":float(m["l"]), "close":float(m["c"]),
-            "volume":int(c.get("volume",0))
-        })
-    df = pd.DataFrame(rows)
-    if df.empty: raise RuntimeError("No completed candles: "+pair)
+# AllTick free HTTP K-line requests need spacing.
+HISTORY_REQUEST_DELAY = 10.5
+
+# Prevent duplicate Telegram signal
+last_signal_minute = {}
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def now_ist():
+    return datetime.now(timezone.utc).astimezone(IST)
+
+
+def trace_id():
+    return str(uuid.uuid4())
+
+
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing")
+        return
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        print("Telegram:", r.status_code)
+
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+# ============================================================
+# ALLTICK HISTORICAL M1 DATA
+# ============================================================
+
+def get_history(pair):
+    query = {
+        "trace": trace_id(),
+        "data": {
+            "code": pair,
+            "kline_type": 1,
+            "kline_timestamp_end": 0,
+            "query_kline_num": HISTORY_CANDLES,
+            "adjust_type": 0
+        }
+    }
+
+    try:
+        r = requests.get(
+            KLINE_URL,
+            params={
+                "token": ALLTICK_TOKEN,
+                "query": json.dumps(query, separators=(",", ":"))
+            },
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data.get("ret") != 200:
+            print("History error", pair, data)
+            return pd.DataFrame()
+
+        candles = data.get("data", {}).get("kline_list", [])
+
+        rows = []
+
+        for c in candles:
+            ts = int(c["timestamp"])
+
+            # Handle seconds or milliseconds
+            if ts > 10_000_000_000:
+                ts = ts / 1000
+
+            rows.append({
+                "timestamp": pd.to_datetime(ts, unit="s", utc=True),
+                "open": float(c["open_price"]),
+                "high": float(c["high_price"]),
+                "low": float(c["low_price"]),
+                "close": float(c["close_price"]),
+                "volume": float(c.get("volume", 0) or 0)
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values("timestamp")
+        df = df.drop_duplicates("timestamp")
+        df = df.reset_index(drop=True)
+
+        return df
+
+    except Exception as e:
+        print("History exception", pair, e)
+        return pd.DataFrame()
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def add_indicators(df):
+
+    df = df.copy()
+
+    df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
+    df["ema10"] = df["close"].ewm(span=10, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    # RSI 14
+    delta = df["close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    df["macd_hist"] = (
+        df["macd"] - df["macd_signal"]
+    )
+
+    # Bollinger Bands
+    df["bb_mid"] = df["close"].rolling(20).mean()
+
+    bb_std = df["close"].rolling(20).std()
+
+    df["bb_upper"] = df["bb_mid"] + (bb_std * 2)
+    df["bb_lower"] = df["bb_mid"] - (bb_std * 2)
+
+    # Support / resistance
+    df["support"] = df["low"].rolling(20).min()
+    df["resistance"] = df["high"].rolling(20).max()
+
     return df
 
-def price(pair):
-    url = f"{BASE}/v3/accounts/{ACCOUNT}/pricing"
-    r = requests.get(url, headers=headers(),
-                     params={"instruments":pair}, timeout=15)
-    r.raise_for_status()
-    p = r.json()["prices"][0]
-    bid, ask = float(p["bids"][0]["price"]), float(p["asks"][0]["price"])
-    return (bid+ask)/2
 
-def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+# ============================================================
+# CANDLE PATTERNS
+# ============================================================
 
-def rsi(s,n=14):
-    d=s.diff()
-    up=d.clip(lower=0); dn=-d.clip(upper=0)
-    a=up.ewm(alpha=1/n,adjust=False).mean()
-    b=dn.ewm(alpha=1/n,adjust=False).mean()
-    rs=a/b.replace(0,pd.NA)
-    return 100-(100/(1+rs))
+def candle_pattern(row, previous=None):
 
-def prepare(df):
-    x=df.copy()
-    x["e5"]=ema(x.close,5); x["e10"]=ema(x.close,10)
-    x["e20"]=ema(x.close,20); x["e50"]=ema(x.close,50)
-    x["rsi"]=rsi(x.close)
-    x["macd"]=ema(x.close,12)-ema(x.close,26)
-    x["macds"]=ema(x.macd,9); x["hist"]=x.macd-x.macds
-    x["mid"]=x.close.rolling(20).mean()
-    sd=x.close.rolling(20).std()
-    x["upper"]=x.mid+2*sd; x["lower"]=x.mid-2*sd
-    x["support"]=x.low.rolling(20).min()
-    x["resistance"]=x.high.rolling(20).max()
-    return x.dropna().reset_index(drop=True)
+    body = abs(row["close"] - row["open"])
 
-def pattern(x):
-    if len(x)<2: return "None"
-    a,b=x.iloc[-2],x.iloc[-1]
-    body=abs(b.close-b.open)
-    upper=b.high-max(b.open,b.close)
-    lower=min(b.open,b.close)-b.low
-    bull=b.close>b.open; bear=b.close<b.open
-    if a.close<a.open and bull and b.open<=a.close and b.close>=a.open:
-        return "Bullish Engulfing"
-    if a.close>a.open and bear and b.open>=a.close and b.close<=a.open:
-        return "Bearish Engulfing"
-    if lower>=max(2*body, (b.high-b.low)*.35) and upper<=max(body,(b.high-b.low)*.15):
+    upper = row["high"] - max(
+        row["open"],
+        row["close"]
+    )
+
+    lower = min(
+        row["open"],
+        row["close"]
+    ) - row["low"]
+
+    candle_range = row["high"] - row["low"]
+
+    if candle_range <= 0:
+        return "None"
+
+    # Bullish engulfing
+    if previous is not None:
+
+        if (
+            previous["close"] < previous["open"]
+            and row["close"] > row["open"]
+            and row["open"] <= previous["close"]
+            and row["close"] >= previous["open"]
+        ):
+            return "Bullish Engulfing"
+
+        # Bearish engulfing
+        if (
+            previous["close"] > previous["open"]
+            and row["close"] < row["open"]
+            and row["open"] >= previous["close"]
+            and row["close"] <= previous["open"]
+        ):
+            return "Bearish Engulfing"
+
+    # Hammer
+    if (
+        lower >= body * 2
+        and upper <= max(body, candle_range * 0.1)
+    ):
         return "Hammer"
-    if upper>=max(2*body, (b.high-b.low)*.35) and lower<=max(body,(b.high-b.low)*.15):
-        return "Shooting Star"
-    return "None"
 
-def analyze(df):
-    x=prepare(df); b=x.iloc[-1]
-    buy=sell=0; why=[]
-    if b.e5>b.e10>b.e20>b.e50: buy+=2; why.append("EMA trend bullish")
-    elif b.e5<b.e10<b.e20<b.e50: sell+=2; why.append("EMA trend bearish")
-    if b.rsi<30: buy+=2; why.append("RSI oversold")
-    elif b.rsi>70: sell+=2; why.append("RSI overbought")
-    elif b.rsi>=50: buy+=1
-    else: sell+=1
-    if b.hist>0: buy+=1; why.append("MACD positive")
-    elif b.hist<0: sell+=1; why.append("MACD negative")
-    if b.close<=b.lower: buy+=1; why.append("Lower Bollinger")
-    elif b.close>=b.upper: sell+=1; why.append("Upper Bollinger")
-    p=pattern(x)
-    if p in ("Bullish Engulfing","Hammer"): buy+=2; why.append(p)
-    if p in ("Bearish Engulfing","Shooting Star"): sell+=2; why.append(p)
-    span=max(b.resistance-b.support,1e-12)
-    if abs(b.close-b.support)<=.10*span: buy+=1; why.append("Near support")
-    if abs(b.resistance-b.close)<=.10*span: sell+=1; why.append("Near resistance")
-    score=max(buy,sell)
-    strength=min(99,int(score/9*100))
-    signal="BUY" if buy>sell and buy>=5 else "SELL" if sell>buy and sell>=5 else "WAIT"
-    return signal,strength,p,b,why
-
-def ist(t):
-    try:
-        return datetime.fromisoformat(str(t).replace("Z","+00:00")).astimezone(IST).strftime("%d-%m-%Y %H:%M:%S IST")
-    except: return str(t)
-
-def send(text):
-    r=requests.post(
-        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-        json={"chat_id":TG_CHAT,"text":text},timeout=15)
-    r.raise_for_status()
-
-def fmt(pair,v):
-    return f"{v:.3f}" if "JPY" in pair else f"{v:.5f}"
-
-def main():
-    missing=[n for n,v in {
-        "OANDA_TOKEN":TOKEN,"OANDA_ACCOUNT_ID":ACCOUNT,
-        "TELEGRAM_TOKEN":TG_TOKEN,"TELEGRAM_CHAT_ID":TG_CHAT}.items() if not v]
-    if missing: raise SystemExit("Missing: "+", ".join(missing))
-    sent={}
-    print("REAL M1 BOT RUNNING:", PAIRS)
-    while True:
-        for pair in PAIRS:
-            try:
-                df=candles(pair)
-                signal,strength,pat,b,why=analyze(df)
-                key=f"{pair}:{b.time}"
-                print(datetime.now(timezone.utc).isoformat(),pair,signal,strength)
-                if signal in ("BUY","SELL") and sent.get(pair)!=key:
-                    live=price(pair)
-                    direction="🟢 CALL / BUY" if signal=="BUY" else "🔴 PUT / SELL"
-                    msg=(
-                        "📊 M1 REAL MARKET SIGNAL\n"
-                        "━━━━━━━━━━━━━━━━\n"
-                        f"PAIR: {pair.replace('_','/')}\n"
-                        f"SIGNAL: {direction}\n"
-                        f"ENTRY: {fmt(pair,live)}\n"
-                        "TIMEFRAME: M1\n"
-                        "EXPIRY REFERENCE: 1 MINUTE\n"
-                        f"MODEL STRENGTH: {strength}%\n"
-                        f"PATTERN: {pat}\n"
-                        f"CANDLE: {ist(b.time)}\n"
-                        "━━━━━━━━━━━━━━━━\n"
-                        "CONFIRMATION:\n"+
-                        "\n".join("• "+z for z in why[:6])+
-                        "\n\n⚠️ Strength is a model score, NOT a guaranteed win probability.\n"
-                        "DATA: OANDA real-market FX feed."
-                    )
-                    send(msg); sent[pair]=key
-            except Exception as e:
-                print("ERROR",pair,repr(e))
-        time.sleep(POLL_SECONDS)
-
-if __name__=="__main__": main()
+    # Shooting star
+    if (
+        upper >= body * 2
+        and lower
