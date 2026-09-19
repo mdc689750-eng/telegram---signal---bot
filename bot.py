@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import logging
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -11,83 +12,91 @@ from pocketoptionapi import PocketOption
 
 
 # =========================================================
-# CONFIG
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("PO_SIGNAL_BOT")
+
+
+# =========================================================
+# ENVIRONMENT
 # =========================================================
 
 PO_SSID = os.getenv("PO_SSID", "").strip()
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_TOKEN", ""
-).strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-# REAL OTC pairs
-OTC_PAIRS = [
+TIMEFRAME = 60
+HISTORY_OFFSET = 45000
+HISTORY_REQUESTS = 3
+
+MIN_CANDLES = 60
+MIN_SCORE = 80
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Desired OTC pairs.
+# The bot will automatically remove unavailable pairs.
+REQUESTED_OTC_PAIRS = [
     "EURUSD_otc",
     "GBPUSD_otc",
     "USDJPY_otc",
     "EURJPY_otc",
     "AUDUSD_otc",
+    "AUDNZD_otc",
 ]
-
-TIMEFRAME = 60
-HISTORY_COUNT = 100
-
-IST = timezone(timedelta(hours=5, minutes=30))
-
-last_signal = {}
-
-api = None
 
 
 # =========================================================
-# HEALTH SERVER - FOR RENDER
+# GLOBAL STATE
+# =========================================================
+
+api = None
+
+last_signal_candle = {}
+last_tick_log = {}
+
+stop_event = threading.Event()
+
+
+# =========================================================
+# HEALTH SERVER FOR RENDER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "text/plain"
-        )
-        self.end_headers()
-        self.wfile.write(
-            b"Pocket Option OTC Signal Bot OK"
-        )
+        body = b"Pocket Option signal bot is running."
 
-    def log_message(self, *args):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
         return
 
 
 def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
 
-    try:
-        port = int(
-            os.getenv("PORT", "10000")
-        )
+    log.info("Health server running on port %s", PORT)
 
-        server = HTTPServer(
-            ("0.0.0.0", port),
-            HealthHandler
-        )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
 
-        print(
-            "Health server running:",
-            port
-        )
-
-        server.serve_forever()
-
-    except Exception as e:
-        print(
-            "Health server error:",
-            e
-        )
+    thread.start()
 
 
 # =========================================================
@@ -96,18 +105,13 @@ def start_health_server():
 
 def send_telegram(message):
 
-    if not TELEGRAM_TOKEN:
-        print("TELEGRAM_TOKEN missing")
-        return
-
-    if not TELEGRAM_CHAT_ID:
-        print("TELEGRAM_CHAT_ID missing")
-        return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials missing.")
+        return False
 
     url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
     payload = {
@@ -116,7 +120,6 @@ def send_telegram(message):
     }
 
     try:
-
         response = requests.post(
             url,
             json=payload,
@@ -124,19 +127,19 @@ def send_telegram(message):
         )
 
         if response.ok:
-            print("Telegram signal sent")
-        else:
-            print(
-                "Telegram error:",
-                response.text[:500]
-            )
+            log.info("Telegram signal sent.")
+            return True
+
+        log.error(
+            "Telegram error: %s %s",
+            response.status_code,
+            response.text[:300]
+        )
 
     except Exception as e:
+        log.error("Telegram exception: %s", e)
 
-        print(
-            "Telegram exception:",
-            e
-        )
+    return False
 
 
 # =========================================================
@@ -157,157 +160,81 @@ def check_config():
         missing.append("TELEGRAM_CHAT_ID")
 
     if missing:
-
-        print(
-            "Missing Environment Variables:"
+        log.error(
+            "Missing environment variables: %s",
+            ", ".join(missing)
         )
-
-        for item in missing:
-            print(
-                " -",
-                item
-            )
-
         return False
 
-    print(
-        "Environment variables OK"
-    )
-
+    log.info("Environment variables OK.")
     return True
 
 
 # =========================================================
-# DATAFRAME NORMALIZATION
+# CANDLE NORMALIZER
 # =========================================================
 
-def normalize_candles(data):
+def normalize_candles(raw):
 
-    if data is None:
-        return None
+    if not raw:
+        return pd.DataFrame()
 
-    try:
+    rows = []
 
-        if isinstance(data, pd.DataFrame):
+    for item in raw:
 
-            df = data.copy()
+        if isinstance(item, dict):
 
-        elif isinstance(data, list):
+            timestamp = (
+                item.get("timestamp")
+                or item.get("time")
+                or item.get("from")
+                or item.get("at")
+            )
 
-            df = pd.DataFrame(data)
+            row = {
+                "timestamp": timestamp,
+                "open": item.get("open"),
+                "high": item.get("high"),
+                "low": item.get("low"),
+                "close": item.get("close"),
+                "volume": item.get("volume", 0),
+            }
 
-        else:
+            rows.append(row)
 
-            return None
+        elif isinstance(item, (list, tuple)) and len(item) >= 5:
 
-    except Exception:
+            rows.append({
+                "timestamp": item[0],
+                "open": item[1],
+                "high": item[2],
+                "low": item[3],
+                "close": item[4],
+                "volume": item[5] if len(item) > 5 else 0,
+            })
 
-        return None
+    if not rows:
+        return pd.DataFrame()
 
-    if df.empty:
-        return None
+    df = pd.DataFrame(rows)
 
-    # Lowercase column names
-    df.columns = [
-        str(c).lower()
-        for c in df.columns
-    ]
-
-    # Common aliases
-    rename_map = {}
-
-    for col in df.columns:
-
-        if col in ["timestamp", "ts", "time_stamp"]:
-            rename_map[col] = "time"
-
-        elif col in ["o"]:
-            rename_map[col] = "open"
-
-        elif col in ["h"]:
-            rename_map[col] = "high"
-
-        elif col in ["l"]:
-            rename_map[col] = "low"
-
-        elif col in ["c"]:
-            rename_map[col] = "close"
-
-    if rename_map:
-        df = df.rename(
-            columns=rename_map
-        )
-
-    required = [
+    for column in [
+        "timestamp",
         "open",
         "high",
         "low",
-        "close"
-    ]
-
-    for col in required:
-
-        if col not in df.columns:
-            return None
-
-        df[col] = pd.to_numeric(
-            df[col],
+        "close",
+        "volume"
+    ]:
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
-        )
-
-    # Time
-    if "time" in df.columns:
-
-        if pd.api.types.is_numeric_dtype(
-            df["time"]
-        ):
-
-            # Detect milliseconds
-            sample = df["time"].dropna()
-
-            if not sample.empty:
-
-                value = float(
-                    sample.iloc[-1]
-                )
-
-                if value > 100000000000:
-                    df["time"] = (
-                        pd.to_datetime(
-                            df["time"],
-                            unit="ms",
-                            utc=True
-                        )
-                    )
-                else:
-                    df["time"] = (
-                        pd.to_datetime(
-                            df["time"],
-                            unit="s",
-                            utc=True
-                        )
-                    )
-
-        else:
-
-            df["time"] = pd.to_datetime(
-                df["time"],
-                utc=True,
-                errors="coerce"
-            )
-
-    else:
-
-        df["time"] = pd.date_range(
-            end=datetime.now(
-                timezone.utc
-            ),
-            periods=len(df),
-            freq="min"
         )
 
     df = df.dropna(
         subset=[
+            "timestamp",
             "open",
             "high",
             "low",
@@ -315,17 +242,110 @@ def normalize_candles(data):
         ]
     )
 
-    df = df.sort_values(
-        "time"
-    )
+    if df.empty:
+        return df
 
+    # Remove duplicate candles.
     df = df.drop_duplicates(
-        subset=["time"]
+        subset=["timestamp"],
+        keep="last"
     )
 
-    return df.reset_index(
-        drop=True
-    )
+    df = df.sort_values("timestamp")
+
+    # Remove currently forming candle.
+    now_ts = int(time.time())
+    current_bucket = now_ts - (now_ts % TIMEFRAME)
+
+    df = df[
+        df["timestamp"] < current_bucket
+    ]
+
+    return df.reset_index(drop=True)
+
+
+# =========================================================
+# TICK NORMALIZER
+# =========================================================
+
+def normalize_ticks(raw_ticks):
+
+    result = []
+
+    if not raw_ticks:
+        return result
+
+    for tick in raw_ticks:
+
+        timestamp = None
+        price = None
+
+        if isinstance(tick, (list, tuple)):
+
+            if len(tick) >= 2:
+                timestamp = tick[0]
+                price = tick[1]
+
+        elif isinstance(tick, dict):
+
+            timestamp = (
+                tick.get("timestamp")
+                or tick.get("time")
+                or tick.get("at")
+            )
+
+            price = (
+                tick.get("price")
+                or tick.get("close")
+                or tick.get("value")
+            )
+
+        if timestamp is None or price is None:
+            continue
+
+        try:
+            timestamp = float(timestamp)
+            price = float(price)
+        except Exception:
+            continue
+
+        result.append(
+            (timestamp, price)
+        )
+
+    result.sort(key=lambda x: x[0])
+
+    return result
+
+
+# =========================================================
+# TICKS -> CANDLE
+# =========================================================
+
+def build_candle_from_ticks(ticks, candle_timestamp):
+
+    prices = []
+
+    for timestamp, price in ticks:
+
+        bucket = int(timestamp) - (
+            int(timestamp) % TIMEFRAME
+        )
+
+        if bucket == candle_timestamp:
+            prices.append(price)
+
+    if not prices:
+        return None
+
+    return {
+        "timestamp": candle_timestamp,
+        "open": prices[0],
+        "high": max(prices),
+        "low": min(prices),
+        "close": prices[-1],
+        "volume": len(prices)
+    }
 
 
 # =========================================================
@@ -334,100 +354,84 @@ def normalize_candles(data):
 
 def add_indicators(df):
 
-    close = df["close"]
+    df = df.copy()
 
     # EMA
-    df["ema5"] = close.ewm(
+    df["ema5"] = df["close"].ewm(
         span=5,
         adjust=False
     ).mean()
 
-    df["ema10"] = close.ewm(
+    df["ema10"] = df["close"].ewm(
         span=10,
         adjust=False
     ).mean()
 
-    df["ema20"] = close.ewm(
+    df["ema20"] = df["close"].ewm(
         span=20,
         adjust=False
     ).mean()
 
-    df["ema50"] = close.ewm(
+    df["ema50"] = df["close"].ewm(
         span=50,
         adjust=False
     ).mean()
 
-    # RSI
-    delta = close.diff()
+    # RSI 14
+    delta = df["close"].diff()
 
-    gain = delta.clip(
-        lower=0
-    )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.rolling(
-        14
+    avg_gain = gain.ewm(
+        alpha=1 / 14,
+        adjust=False
     ).mean()
 
-    avg_loss = loss.rolling(
-        14
+    avg_loss = loss.ewm(
+        alpha=1 / 14,
+        adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        1e-12
-    )
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
 
-    df["rsi"] = (
-        100 -
-        (100 / (1 + rs))
+    df["rsi"] = 100 - (
+        100 / (1 + rs)
     )
 
     # MACD
-    ema12 = close.ewm(
+    ema12 = df["close"].ewm(
         span=12,
         adjust=False
     ).mean()
 
-    ema26 = close.ewm(
+    ema26 = df["close"].ewm(
         span=26,
         adjust=False
     ).mean()
 
-    df["macd"] = (
-        ema12 - ema26
-    )
+    df["macd"] = ema12 - ema26
 
-    df["macd_signal"] = (
-        df["macd"].ewm(
-            span=9,
-            adjust=False
-        ).mean()
-    )
+    df["macd_signal"] = df["macd"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
     df["macd_hist"] = (
         df["macd"] -
         df["macd_signal"]
     )
 
-    # Bollinger
-    df["bb_mid"] = close.rolling(
-        20
-    ).mean()
+    # Bollinger Bands
+    bb_mid = df["close"].rolling(20).mean()
+    bb_std = df["close"].rolling(20).std()
 
-    std = close.rolling(
-        20
-    ).std()
-
-    df["bb_upper"] = (
-        df["bb_mid"] + 2 * std
+    df["bb_mid"] = bb_mid
+    df["bb_upper"] = bb_mid + (
+        2 * bb_std
     )
-
-    df["bb_lower"] = (
-        df["bb_mid"] - 2 * std
+    df["bb_lower"] = bb_mid - (
+        2 * bb_std
     )
 
     # Support / Resistance
@@ -446,90 +450,96 @@ def add_indicators(df):
 # CANDLE PATTERN
 # =========================================================
 
-def get_pattern(row, previous):
+def candle_pattern(df):
+
+    if len(df) < 3:
+        return "None"
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
     body = abs(
-        row["close"] -
-        row["open"]
+        last["close"] - last["open"]
     )
 
     candle_range = (
-        row["high"] -
-        row["low"]
+        last["high"] - last["low"]
     )
 
     if candle_range <= 0:
-        return "NONE"
+        return "None"
 
-    upper = (
-        row["high"] -
-        max(
-            row["open"],
-            row["close"]
-        )
+    upper_wick = (
+        last["high"] -
+        max(last["open"], last["close"])
     )
 
-    lower = (
-        min(
-            row["open"],
-            row["close"]
-        ) -
-        row["low"]
+    lower_wick = (
+        min(last["open"], last["close"]) -
+        last["low"]
     )
 
     # Bullish engulfing
-    if (
-        previous["close"] <
-        previous["open"]
+    bullish_engulfing = (
+        prev["close"] < prev["open"]
         and
-        row["close"] >
-        row["open"]
+        last["close"] > last["open"]
         and
-        row["open"] <=
-        previous["close"]
+        last["open"] <= prev["close"]
         and
-        row["close"] >=
-        previous["open"]
-    ):
-        return "BULLISH ENGULFING"
+        last["close"] >= prev["open"]
+    )
+
+    if bullish_engulfing:
+        return "Bullish Engulfing"
 
     # Bearish engulfing
-    if (
-        previous["close"] >
-        previous["open"]
+    bearish_engulfing = (
+        prev["close"] > prev["open"]
         and
-        row["close"] <
-        row["open"]
+        last["close"] < last["open"]
         and
-        row["open"] >=
-        previous["close"]
+        last["open"] >= prev["close"]
         and
-        row["close"] <=
-        previous["open"]
-    ):
-        return "BEARISH ENGULFING"
+        last["close"] <= prev["open"]
+    )
+
+    if bearish_engulfing:
+        return "Bearish Engulfing"
 
     # Hammer
     if (
-        lower >= body * 2
+        lower_wick >= body * 2
         and
-        upper <= max(body, 1e-10)
-        and
-        body <= candle_range * 0.4
+        upper_wick <= body
     ):
-        return "HAMMER"
+        return "Hammer"
 
     # Shooting star
     if (
-        upper >= body * 2
+        upper_wick >= body * 2
         and
-        lower <= max(body, 1e-10)
-        and
-        body <= candle_range * 0.4
+        lower_wick <= body
     ):
-        return "SHOOTING STAR"
+        return "Shooting Star"
 
-    return "NONE"
+    # Strong bullish candle
+    if (
+        last["close"] > last["open"]
+        and
+        body >= candle_range * 0.65
+    ):
+        return "Strong Bullish"
+
+    # Strong bearish candle
+    if (
+        last["close"] < last["open"]
+        and
+        body >= candle_range * 0.65
+    ):
+        return "Strong Bearish"
+
+    return "Normal"
 
 
 # =========================================================
@@ -538,221 +548,198 @@ def get_pattern(row, previous):
 
 def analyze(df):
 
-    if df is None:
-        return None
+    if df is None or len(df) < MIN_CANDLES:
+        return {
+            "signal": "WAIT",
+            "score": 0,
+            "pattern": "Not enough candles",
+            "reasons": []
+        }
 
-    if len(df) < 60:
-        return None
-
-    df = add_indicators(
-        df.copy()
-    )
+    df = add_indicators(df)
 
     row = df.iloc[-1]
-    previous = df.iloc[-2]
 
-    needed = [
-        "ema20",
-        "ema50",
-        "rsi",
-        "macd_hist",
-        "bb_mid",
-        "support",
-        "resistance"
-    ]
-
-    for col in needed:
-
-        if pd.isna(row[col]):
-            return None
-
-    price = float(
-        row["close"]
-    )
-
-    buy = 0
-    sell = 0
+    buy_score = 0
+    sell_score = 0
 
     buy_reasons = []
     sell_reasons = []
 
-    # EMA trend
+    close = float(row["close"])
+
+    # -----------------------------------------------------
+    # EMA TREND
+    # -----------------------------------------------------
+
     if (
-        row["ema5"] >
-        row["ema10"] >
-        row["ema20"] >
-        row["ema50"]
+        row["ema5"] > row["ema10"]
+        and
+        row["ema10"] > row["ema20"]
+        and
+        row["ema20"] > row["ema50"]
     ):
-
-        buy += 25
-
-        buy_reasons.append(
-            "EMA bullish trend"
-        )
+        buy_score += 20
+        buy_reasons.append("EMA bullish trend")
 
     elif (
-        row["ema5"] <
-        row["ema10"] <
-        row["ema20"] <
-        row["ema50"]
+        row["ema5"] < row["ema10"]
+        and
+        row["ema10"] < row["ema20"]
+        and
+        row["ema20"] < row["ema50"]
     ):
+        sell_score += 20
+        sell_reasons.append("EMA bearish trend")
 
-        sell += 25
-
-        sell_reasons.append(
-            "EMA bearish trend"
-        )
-
+    # -----------------------------------------------------
     # RSI
+    # -----------------------------------------------------
+
+    if pd.notna(row["rsi"]):
+
+        if 30 <= row["rsi"] <= 50:
+            buy_score += 15
+            buy_reasons.append(
+                f"RSI bullish zone {row['rsi']:.1f}"
+            )
+
+        elif 50 < row["rsi"] <= 70:
+            sell_score += 5
+            sell_reasons.append(
+                f"RSI upper zone {row['rsi']:.1f}"
+            )
+
+        elif row["rsi"] < 30:
+            buy_score += 20
+            buy_reasons.append(
+                f"RSI oversold {row['rsi']:.1f}"
+            )
+
+        elif row["rsi"] > 70:
+            sell_score += 20
+            sell_reasons.append(
+                f"RSI overbought {row['rsi']:.1f}"
+            )
+
+    # -----------------------------------------------------
+    # MACD
+    # -----------------------------------------------------
+
     if (
-        row["rsi"] >= 50
+        row["macd"] > row["macd_signal"]
         and
-        row["rsi"] <= 70
+        row["macd_hist"] > 0
     ):
-
-        buy += 15
-
-        buy_reasons.append(
-            "RSI bullish"
-        )
+        buy_score += 20
+        buy_reasons.append("MACD bullish")
 
     elif (
-        row["rsi"] >= 30
+        row["macd"] < row["macd_signal"]
         and
-        row["rsi"] < 50
+        row["macd_hist"] < 0
     ):
+        sell_score += 20
+        sell_reasons.append("MACD bearish")
 
-        sell += 15
+    # -----------------------------------------------------
+    # BOLLINGER
+    # -----------------------------------------------------
 
-        sell_reasons.append(
-            "RSI bearish"
-        )
+    if pd.notna(row["bb_lower"]) and close <= row["bb_lower"]:
 
-    # MACD
-    if row["macd_hist"] > 0:
-
-        buy += 15
-
+        buy_score += 15
         buy_reasons.append(
-            "MACD positive"
+            "Lower Bollinger rejection"
         )
 
-    elif row["macd_hist"] < 0:
+    if pd.notna(row["bb_upper"]) and close >= row["bb_upper"]:
 
-        sell += 15
-
+        sell_score += 15
         sell_reasons.append(
-            "MACD negative"
+            "Upper Bollinger rejection"
         )
 
-    # Bollinger
-    if price > row["bb_mid"]:
+    # -----------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # -----------------------------------------------------
 
-        buy += 10
+    if pd.notna(row["support"]):
 
-        buy_reasons.append(
-            "Price above BB middle"
+        support_distance = abs(
+            close - row["support"]
         )
 
-    elif price < row["bb_mid"]:
+        if (
+            support_distance
+            <= close * 0.0015
+        ):
+            buy_score += 10
+            buy_reasons.append(
+                "Near support"
+            )
 
-        sell += 10
+    if pd.notna(row["resistance"]):
 
-        sell_reasons.append(
-            "Price below BB middle"
+        resistance_distance = abs(
+            close - row["resistance"]
         )
 
-    # Support
-    if (
-        abs(price - row["support"])
-        / price
-        < 0.001
-    ):
+        if (
+            resistance_distance
+            <= close * 0.0015
+        ):
+            sell_score += 10
+            sell_reasons.append(
+                "Near resistance"
+            )
 
-        buy += 15
+    # -----------------------------------------------------
+    # CANDLE PATTERN
+    # -----------------------------------------------------
 
-        buy_reasons.append(
-            "Near support"
-        )
-
-    # Resistance
-    if (
-        abs(
-            row["resistance"] -
-            price
-        )
-        / price
-        < 0.001
-    ):
-
-        sell += 15
-
-        sell_reasons.append(
-            "Near resistance"
-        )
-
-    # Pattern
-    pattern = get_pattern(
-        row,
-        previous
-    )
+    pattern = candle_pattern(df)
 
     if pattern in [
-        "BULLISH ENGULFING",
-        "HAMMER"
+        "Bullish Engulfing",
+        "Hammer",
+        "Strong Bullish"
     ]:
-
-        buy += 20
-
-        buy_reasons.append(
-            pattern
-        )
+        buy_score += 15
+        buy_reasons.append(pattern)
 
     elif pattern in [
-        "BEARISH ENGULFING",
-        "SHOOTING STAR"
+        "Bearish Engulfing",
+        "Shooting Star",
+        "Strong Bearish"
     ]:
+        sell_score += 15
+        sell_reasons.append(pattern)
 
-        sell += 20
-
-        sell_reasons.append(
-            pattern
-        )
-
-    buy = min(
-        buy,
-        100
-    )
-
-    sell = min(
-        sell,
-        100
-    )
+    # -----------------------------------------------------
+    # DECISION
+    # -----------------------------------------------------
 
     if (
-        buy >= 80
+        buy_score >= MIN_SCORE
         and
-        buy > sell
+        buy_score > sell_score
     ):
-
         return {
             "signal": "BUY",
-            "score": buy,
-            "price": price,
+            "score": min(buy_score, 100),
             "pattern": pattern,
             "reasons": buy_reasons
         }
 
     if (
-        sell >= 80
+        sell_score >= MIN_SCORE
         and
-        sell > buy
+        sell_score > buy_score
     ):
-
         return {
             "signal": "SELL",
-            "score": sell,
-            "price": price,
+            "score": min(sell_score, 100),
             "pattern": pattern,
             "reasons": sell_reasons
         }
@@ -760,47 +747,185 @@ def analyze(df):
     return {
         "signal": "WAIT",
         "score": max(
-            buy,
-            sell
+            buy_score,
+            sell_score
         ),
-        "price": price,
         "pattern": pattern,
         "reasons": []
     }
 
 
 # =========================================================
-# PRICE FORMAT
+# HISTORY
 # =========================================================
 
-def format_price(
-    pair,
-    price
-):
-
-    if "JPY" in pair:
-        return f"{price:.3f}"
-
-    return f"{price:.5f}"
-
-
-# =========================================================
-# SERVER TIME
-# =========================================================
-
-def get_server_now():
+def load_pair_history(pair):
 
     try:
 
-        if api is not None:
-            return api.get_server_datetime()
+        candles = api.get_historical_candles(
+            pair,
+            period=TIMEFRAME,
+            offset=HISTORY_OFFSET,
+            count_request=HISTORY_REQUESTS
+        )
 
-    except Exception:
-        pass
+        df = normalize_candles(candles)
 
-    return datetime.now(
-        timezone.utc
-    )
+        log.info(
+            "%s | history = %d candles",
+            pair,
+            len(df)
+        )
+
+        return df
+
+    except Exception as e:
+
+        log.error(
+            "%s | history error: %s",
+            pair,
+            e
+        )
+
+        return pd.DataFrame()
+
+
+# =========================================================
+# AVAILABLE PAIRS
+# =========================================================
+
+def get_available_pairs():
+
+    try:
+
+        assets = api.get_assets()
+
+        if not assets:
+            log.error("Asset catalog is empty.")
+            return []
+
+        available = []
+
+        for pair in REQUESTED_OTC_PAIRS:
+
+            info = assets.get(pair)
+
+            if not info:
+                log.warning(
+                    "%s | not found in asset catalog",
+                    pair
+                )
+                continue
+
+            is_available = info.get(
+                "is_available",
+                False
+            )
+
+            if is_available:
+
+                available.append(pair)
+
+                log.info(
+                    "%s | AVAILABLE | payout=%s | timeframes=%s",
+                    pair,
+                    info.get("payout"),
+                    info.get("timeframes")
+                )
+
+            else:
+
+                log.warning(
+                    "%s | currently unavailable",
+                    pair
+                )
+
+        return available
+
+    except Exception as e:
+
+        log.error(
+            "Asset catalog error: %s",
+            e
+        )
+
+        return []
+
+
+# =========================================================
+# CONNECTION
+# =========================================================
+
+def connect_pocket():
+
+    global api
+
+    log.info("Connecting to Pocket Option...")
+
+    try:
+
+        api = PocketOption(PO_SSID)
+
+        ok, error = api.connect()
+
+        if not ok:
+
+            log.error(
+                "Pocket Option connection failed: %s",
+                error
+            )
+
+            return False
+
+        log.info(
+            "Pocket Option WebSocket connected."
+        )
+
+        # Wait for connection + server time sync.
+        for _ in range(300):
+
+            if (
+                api.check_connect()
+                and
+                api.is_time_synced()
+            ):
+
+                log.info(
+                    "Pocket Option time synchronized."
+                )
+
+                try:
+                    server_time = (
+                        api.get_server_datetime()
+                    )
+
+                    log.info(
+                        "Pocket Option server time: %s",
+                        server_time
+                    )
+
+                except Exception:
+                    pass
+
+                return True
+
+            time.sleep(0.2)
+
+        log.error(
+            "Connection established but time synchronization timed out."
+        )
+
+        return False
+
+    except Exception as e:
+
+        log.exception(
+            "Pocket Option connection exception: %s",
+            e
+        )
+
+        return False
 
 
 # =========================================================
@@ -810,328 +935,292 @@ def get_server_now():
 def send_signal(
     pair,
     result,
-    candle_time
+    entry_price,
+    candle_timestamp
 ):
 
-    if result is None:
+    signal = result["signal"]
+
+    if signal not in [
+        "BUY",
+        "SELL"
+    ]:
         return
 
-    if result["signal"] == "WAIT":
-        return
+    # One signal per candle.
+    if last_signal_candle.get(pair) == candle_timestamp:
 
-    # Candle close -> next candle entry
-    entry_utc = (
-        candle_time +
-        timedelta(seconds=60)
-    )
-
-    expiry_utc = (
-        entry_utc +
-        timedelta(seconds=60)
-    )
-
-    entry_ist = entry_utc.astimezone(
-        IST
-    )
-
-    expiry_ist = expiry_utc.astimezone(
-        IST
-    )
-
-    signal_key = (
-        pair,
-        entry_utc.strftime(
-            "%Y-%m-%d %H:%M"
+        log.info(
+            "%s | duplicate signal skipped",
+            pair
         )
-    )
 
-    if signal_key in last_signal:
         return
 
-    last_signal[signal_key] = True
+    last_signal_candle[pair] = candle_timestamp
+
+    entry_timestamp = (
+        candle_timestamp + TIMEFRAME
+    )
+
+    expiry_timestamp = (
+        entry_timestamp + TIMEFRAME
+    )
+
+    entry_dt = datetime.fromtimestamp(
+        entry_timestamp,
+        tz=timezone.utc
+    ).astimezone(IST)
+
+    expiry_dt = datetime.fromtimestamp(
+        expiry_timestamp,
+        tz=timezone.utc
+    ).astimezone(IST)
 
     reasons = result.get(
         "reasons",
         []
     )
 
-    if reasons:
-
-        reason_text = "\n".join(
-            "• " + x
-            for x in reasons
-        )
-
-    else:
-
-        reason_text = "• Multiple confirmations"
+    reason_text = ", ".join(
+        reasons[:4]
+    )
 
     message = (
-        "🟠 REAL OTC — M1 SIGNAL\n\n"
-        f"PAIR: {pair}\n"
-        f"SIGNAL: {result['signal']}\n"
-        f"ENTRY PRICE: "
-        f"{format_price(pair, result['price'])}\n\n"
-        "TIMEFRAME: 1 MINUTE\n"
-        f"ENTRY TIME: "
-        f"{entry_ist.strftime('%H:%M:%S')} IST\n"
-        f"EXPIRY TIME: "
-        f"{expiry_ist.strftime('%H:%M:%S')} IST\n\n"
-        f"MODEL SCORE: "
-        f"{result['score']}/100\n"
-        f"PATTERN: {result['pattern']}\n\n"
-        "CONFIRMATION:\n"
-        f"{reason_text}\n\n"
-        "⚠️ Score is a model score, "
-        "not a guaranteed win probability."
-    )
-
-    print(
-        "\n" +
-        message +
+        "📊 POCKET OPTION OTC SIGNAL\n"
         "\n"
+        f"PAIR: {pair}\n"
+        f"SIGNAL: {signal}\n"
+        f"MODEL SCORE: {result['score']}/100\n"
+        f"ENTRY PRICE: {entry_price:.6f}\n"
+        "\n"
+        f"ENTRY: {entry_dt.strftime('%H:%M:%S')} IST\n"
+        f"EXPIRY: {expiry_dt.strftime('%H:%M:%S')} IST\n"
+        "\n"
+        f"PATTERN: {result['pattern']}\n"
+        f"CONFIRMATION: {reason_text}\n"
+        "\n"
+        "TIMEFRAME: 1 MIN\n"
+        "MODE: OTC\n"
+        "\n"
+        "⚠️ Signal/data only. No automatic trade."
     )
 
-    send_telegram(
-        message
+    send_telegram(message)
+
+    log.info(
+        "%s | %s | score=%s | entry=%s",
+        pair,
+        signal,
+        result["score"],
+        entry_price
     )
 
 
 # =========================================================
-# LOAD HISTORY
+# MONITOR ONE PAIR
 # =========================================================
 
-def load_pair_history(
-    pair
-):
+def monitor_pair(pair):
 
-    print(
-        "Loading:",
+    log.info(
+        "%s | monitor started",
         pair
     )
 
-    try:
+    history = load_pair_history(pair)
 
-        candles = api.get_historical_candles(
+    if len(history) < MIN_CANDLES:
+
+        log.error(
+            "%s | only %d candles. Need at least %d.",
             pair,
-            period=TIMEFRAME,
-            offset=45000,
-            count_request=1
+            len(history),
+            MIN_CANDLES
         )
 
-        df = normalize_candles(
-            candles
-        )
+        return
 
-        if df is None:
-
-            print(
-                pair,
-                "history unavailable"
-            )
-
-            return None
-
-        # Remove forming candle
-        if len(df) > 1:
-            df = df.iloc[:-1].copy()
-
-        print(
-            pair,
-            "history:",
-            len(df),
-            "candles"
-        )
-
-        return df
-
-    except Exception as e:
-
-        print(
-            pair,
-            "history error:",
-            e
-        )
-
-        return None
-
-
-# =========================================================
-# LIVE TICK PROCESSOR
-# =========================================================
-
-def monitor_pair(
-    pair,
-    history_df
-):
-
-    candles = history_df.copy()
-
-    current = None
-
-    previous_minute = None
-
-    print(
-        "Monitoring:",
-        pair
+    log.info(
+        "%s | history ready: %d candles",
+        pair,
+        len(history)
     )
 
-    while True:
+    current_candle_timestamp = None
+    current_candle = None
+
+    while not stop_event.is_set():
 
         try:
 
-            ticks = api.get_realtime_ticks(
+            if not api.check_connect():
+
+                log.warning(
+                    "%s | websocket disconnected",
+                    pair
+                )
+
+                time.sleep(2)
+                continue
+
+            ticks_raw = api.get_realtime_ticks(
                 pair,
-                limit=20
+                limit=200
+            )
+
+            ticks = normalize_ticks(
+                ticks_raw
             )
 
             if not ticks:
 
-                time.sleep(0.5)
+                time.sleep(1)
                 continue
 
-            tick = ticks[-1]
+            latest_timestamp, latest_price = ticks[-1]
 
-            if isinstance(
-                tick,
-                (list, tuple)
+            # Log latest price once every 10 seconds.
+            now = time.time()
+
+            if (
+                now -
+                last_tick_log.get(pair, 0)
+                >= 10
             ):
 
-                ts = tick[0]
-                price = tick[1]
+                last_tick_log[pair] = now
 
-            elif isinstance(
-                tick,
-                dict
-            ):
-
-                ts = (
-                    tick.get("timestamp")
-                    or tick.get("time")
-                    or tick.get("tick_time")
+                log.info(
+                    "%s | LIVE price=%s | tick=%s",
+                    pair,
+                    latest_price,
+                    latest_timestamp
                 )
 
-                price = (
-                    tick.get("price")
-                    or tick.get("value")
+            bucket = (
+                int(latest_timestamp)
+                -
+                (
+                    int(latest_timestamp)
+                    % TIMEFRAME
                 )
-
-            else:
-
-                time.sleep(0.5)
-                continue
-
-            ts = float(ts)
-            price = float(price)
-
-            if ts > 100000000000:
-                ts /= 1000
-
-            tick_dt = datetime.fromtimestamp(
-                ts,
-                tz=timezone.utc
             )
 
-            minute = tick_dt.replace(
-                second=0,
-                microsecond=0
-            )
+            # First candle.
+            if current_candle_timestamp is None:
 
-            # First live candle
-            if current is None:
+                current_candle_timestamp = bucket
 
-                current = {
-                    "time": minute,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price
-                }
+                current_candle = (
+                    build_candle_from_ticks(
+                        ticks,
+                        bucket
+                    )
+                )
 
-                previous_minute = minute
-
-                time.sleep(0.5)
+                time.sleep(1)
                 continue
 
-            # Same minute
-            if minute == current["time"]:
+            # Same candle -> update.
+            if bucket == current_candle_timestamp:
 
-                current["high"] = max(
-                    current["high"],
-                    price
+                new_candle = (
+                    build_candle_from_ticks(
+                        ticks,
+                        bucket
+                    )
                 )
 
-                current["low"] = min(
-                    current["low"],
-                    price
-                )
+                if new_candle:
+                    current_candle = new_candle
 
-                current["close"] = price
+                time.sleep(1)
+                continue
 
-            # New minute
-            elif minute > current["time"]:
+            # NEW CANDLE STARTED.
+            # Previous candle is now closed.
 
-                completed = current.copy()
+            closed_candle = current_candle
 
-                candles = pd.concat(
+            if closed_candle:
+
+                history = pd.concat(
                     [
-                        candles,
+                        history,
                         pd.DataFrame(
-                            [completed]
+                            [closed_candle]
                         )
                     ],
                     ignore_index=True
                 )
 
-                candles = candles.tail(
-                    150
-                ).reset_index(
-                    drop=True
+                history = history.drop_duplicates(
+                    subset=["timestamp"],
+                    keep="last"
                 )
 
-                result = analyze(
-                    candles
+                history = history.sort_values(
+                    "timestamp"
                 )
 
-                # Entry is the NEW candle
-                send_signal(
+                # Keep enough history.
+                if len(history) > 500:
+
+                    history = history.tail(
+                        500
+                    ).reset_index(drop=True)
+
+                log.info(
+                    "%s | NEW M1 candle | closed=%s | close=%s",
                     pair,
-                    result,
-                    completed["time"]
+                    closed_candle["timestamp"],
+                    closed_candle["close"]
                 )
 
-                # New candle
-                current = {
-                    "time": minute,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price
-                }
+                result = analyze(history)
 
-                previous_minute = minute
-
-                print(
+                log.info(
+                    "%s | result=%s | score=%s | pattern=%s",
                     pair,
-                    "new M1:",
-                    minute.astimezone(
-                        IST
-                    ).strftime(
-                        "%H:%M:%S"
-                    ),
-                    format_price(
+                    result["signal"],
+                    result["score"],
+                    result["pattern"]
+                )
+
+                if result["signal"] in [
+                    "BUY",
+                    "SELL"
+                ]:
+
+                    send_signal(
                         pair,
-                        price
+                        result,
+                        float(
+                            closed_candle["close"]
+                        ),
+                        int(
+                            closed_candle["timestamp"]
+                        )
                     )
-                )
 
-            time.sleep(0.5)
+            # Start new candle.
+            current_candle_timestamp = bucket
+
+            current_candle = (
+                build_candle_from_ticks(
+                    ticks,
+                    bucket
+                )
+            )
+
+            time.sleep(1)
 
         except Exception as e:
 
-            print(
+            log.exception(
+                "%s | monitor error: %s",
                 pair,
-                "monitor error:",
                 e
             )
 
@@ -1139,163 +1228,116 @@ def monitor_pair(
 
 
 # =========================================================
-# CONNECT POCKET OPTION
-# =========================================================
-
-def connect_pocket():
-
-    global api
-
-    print(
-        "Connecting to Pocket Option..."
-    )
-
-    # IMPORTANT:
-    # The SSID itself contains isDemo.
-    # Real account SSID must contain:
-    # "isDemo":0
-
-    api = PocketOption(
-        PO_SSID
-    )
-
-    ok, error = api.connect()
-
-    if not ok:
-
-        print(
-            "Pocket Option connection failed:",
-            error
-        )
-
-        return False
-
-    print(
-        "Pocket Option WebSocket connected"
-    )
-
-    # Wait for time sync
-    for _ in range(300):
-
-        try:
-
-            if (
-                api.check_connect()
-                and
-                api.is_time_synced()
-            ):
-                print(
-                    "Pocket Option time synchronized"
-                )
-                return True
-
-        except Exception:
-            pass
-
-        time.sleep(0.1)
-
-    print(
-        "Time synchronization timeout"
-    )
-
-    return False
-
-
-# =========================================================
-# START OTC
+# START OTC MONITORING
 # =========================================================
 
 def start_otc():
 
-    if not connect_pocket():
-        return
+    global api
 
-    # Subscribe to OTC streams
-    for pair in OTC_PAIRS:
+    while not stop_event.is_set():
 
-        try:
+        # -------------------------------------------------
+        # CONNECT
+        # -------------------------------------------------
 
-            api.subscribe(
-                pair,
-                period=TIMEFRAME
+        if not api or not api.check_connect():
+
+            if not connect_pocket():
+
+                log.error(
+                    "Connection failed. Retry in 15 seconds."
+                )
+
+                time.sleep(15)
+                continue
+
+        # -------------------------------------------------
+        # GET LIVE AVAILABLE PAIRS
+        # -------------------------------------------------
+
+        pairs = get_available_pairs()
+
+        if not pairs:
+
+            log.error(
+                "No requested OTC pair is currently available."
             )
 
-            print(
-                "Subscribed:",
-                pair
-            )
-
-            time.sleep(1)
-
-        except Exception as e:
-
-            print(
-                "Subscribe error:",
-                pair,
-                e
-            )
-
-    # Load history
-    histories = {}
-
-    for pair in OTC_PAIRS:
-
-        histories[pair] = (
-            load_pair_history(
-                pair
-            )
-        )
-
-        time.sleep(1)
-
-    # Start monitoring
-    threads = []
-
-    for pair in OTC_PAIRS:
-
-        df = histories.get(
-            pair
-        )
-
-        if df is None:
+            time.sleep(30)
             continue
 
-        thread = threading.Thread(
-            target=monitor_pair,
-            args=(
-                pair,
-                df
-            ),
-            daemon=True
+        log.info(
+            "Available OTC pairs: %s",
+            ", ".join(pairs)
         )
 
-        thread.start()
+        # -------------------------------------------------
+        # SUBSCRIBE
+        # -------------------------------------------------
 
-        threads.append(
-            thread
-        )
+        for pair in pairs:
 
-    print(
-        "REAL OTC monitoring started"
-    )
+            try:
 
-    # Keep process alive
-    while True:
+                api.subscribe(
+                    pair,
+                    period=TIMEFRAME
+                )
 
-        time.sleep(30)
+                log.info(
+                    "%s | subscribed M1",
+                    pair
+                )
 
-        try:
+            except Exception as e:
+
+                log.error(
+                    "%s | subscribe error: %s",
+                    pair,
+                    e
+                )
+
+        # -------------------------------------------------
+        # START MONITORS
+        # -------------------------------------------------
+
+        threads = []
+
+        for pair in pairs:
+
+            thread = threading.Thread(
+                target=monitor_pair,
+                args=(pair,),
+                daemon=True
+            )
+
+            thread.start()
+
+            threads.append(thread)
+
+            # Small delay prevents all subscriptions
+            # from hitting the server at exactly once.
+            time.sleep(0.5)
+
+        # -------------------------------------------------
+        # KEEP MAIN LOOP ALIVE
+        # -------------------------------------------------
+
+        while not stop_event.is_set():
 
             if not api.check_connect():
 
-                print(
-                    "Pocket Option disconnected"
+                log.warning(
+                    "Pocket Option disconnected. Reconnecting..."
                 )
 
                 break
 
-        except Exception:
-            break
+            time.sleep(5)
+
+        # Give old monitor threads time to notice disconnect.
+        time.sleep(3)
 
 
 # =========================================================
@@ -1304,29 +1346,63 @@ def start_otc():
 
 def main():
 
-    print(
-        "=" * 55
+    log.info(
+        "=========================================="
     )
 
-    print(
-        "POCKET OPTION REAL OTC TELEGRAM SIGNAL BOT"
+    log.info(
+        "Pocket Option OTC Signal Bot Starting"
     )
 
-    print(
-        "=" * 55
+    log.info(
+        "Mode: SIGNAL/DATA ONLY"
     )
+
+    log.info(
+        "Timeframe: 1 Minute"
+    )
+
+    log.info(
+        "Minimum model score: %s",
+        MIN_SCORE
+    )
+
+    log.info(
+        "=========================================="
+    )
+
+    start_health_server()
 
     if not check_config():
-        return
 
-    # Render health server
-    threading.Thread(
-        target=start_health_server,
-        daemon=True
-    ).start()
+        log.error(
+            "Configuration incomplete. Bot stopped."
+        )
+
+        while True:
+            time.sleep(60)
 
     start_otc()
 
 
 if __name__ == "__main__":
-    main()
+
+    try:
+        main()
+
+    except KeyboardInterrupt:
+
+        stop_event.set()
+
+        log.info(
+            "Bot stopped."
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "Fatal error: %s",
+            e
+        )
+
+        stop_event.set()
